@@ -4,9 +4,22 @@ import { Badge, when } from "../format";
 import { useApi } from "../useApi";
 import SourcesCard from "./SourcesCard";
 
+// =============================================================================
+// pages/System.tsx: THE SYSTEM TAB (admin only): THE OPERATOR'S DASHBOARD
+// -----------------------------------------------------------------------------
+// GET /api/system every 4 seconds (live). Sections, top to bottom:
+//   1. four health numbers (queue backlog, workers alive, needs review, failed)
+//   2. action buttons (run scoring, retry failed, poll, seed simulation)
+//   3. recent scoring runs
+//   4. the Sources card (preview/ingest from any source: SourcesCard.tsx)
+//   5. the funnel (how many posts in each status) and the workers list
+//   6. dead letters (only if there are any)
+//   7. read-only configuration
+// =============================================================================
 // Operator page. Rule: every element answers a question an operator would actually ask,
 // and each one says why it matters right next to it.
 
+// Plain-English meaning of each post status, shown in the funnel table.
 const STATUS_HELP: Record<string, string> = {
   pending: "waiting for a worker",
   extracted: "produced ideas",
@@ -20,6 +33,8 @@ export default function System() {
   const { data, error, reload } = useApi<SystemInfo>("/api/system", 4000, true);
   const [msg, setMsg] = useState<string | null>(null);
 
+  // Shared click handler for every action button: POST to `path` (with the admin token),
+  // show a message built by `done` from the response, and refresh the page data.
   async function action(path: string, done: (r: Record<string, unknown>) => string) {
     setMsg(null);
     try {
@@ -152,6 +167,10 @@ export default function System() {
   );
 }
 
+// Small building blocks used above, so each section's markup stays short:
+//   Stat   = a big number + label + explanation (orange border if warn)
+//   Action = a button + why you'd press it
+//   Cfg    = one configuration value + what it explains
 function Stat({ label, value, why, warn }: { label: string; value: number | null | undefined; why: string; warn?: boolean }) {
   return (
     <div className={`card stat ${warn ? "warn" : ""}`}>

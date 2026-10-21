@@ -1,13 +1,26 @@
+// =============================================================================
+// pages/Signals.tsx: THE SIGNALS TAB
+// -----------------------------------------------------------------------------
+// Shows the newest signal snapshot (GET /api/signals), written by the last scoring run:
+//   left:  per-ticker skill-weighted direction (a meter from -1 to +1), conviction, and
+//          the paper portfolio's weight in that ticker
+//   right: the portfolio's risk (VaR, CVaR, volatility) and the skill model's sigma/tau
+// =============================================================================
 import type { SignalsPayload } from "../api";
 import { num, pct, signedPct, when } from "../format";
 import { useApi } from "../useApi";
 
 export default function Signals() {
   const { data, error } = useApi<SignalsPayload>("/api/signals");
+  // "Early returns": handle the error and loading cases first, so the main markup below
+  // can assume data exists.
   if (error) return <section className="card"><div className="error">{error}</div></section>;
   if (!data) return <section className="card"><p className="muted">loading…</p></section>;
+  // Only tickers with SOME skilled weight behind them (unproven-only tickers are hidden).
   const live = data.signals.filter((s) => s.weight_mass > 0);
 
+  // The meter: a bar growing right from the centre for positive scores, left for negative.
+  // sigma and tau are stored squared (variances), hence Math.sqrt for display.
   return (
     <section className="grid-2 wide-left">
       <div className="card">

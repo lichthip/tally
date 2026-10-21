@@ -1,7 +1,19 @@
+// =============================================================================
+// pages/Submit.tsx: THE "SUBMIT" TAB: TYPE A POST, THEN WATCH IT GO THROUGH THE PIPELINE
+// -----------------------------------------------------------------------------
+// Flow when you click Submit:
+//   1. POST /api/posts                 -> the backend saves it, queues a job, answers 202 at once
+//   2. every 1 s: GET /api/posts/{id}  -> "polling" until status is no longer "pending"
+//      (a worker picked it up, called the LLM, and saved the outcome), or 2 minutes pass
+//   3. show the outcome: status badge, notes, and any extracted ideas
+// This page is the whole "async" design made visible: the API answers immediately and
+// the slow LLM work happens in the background worker.
+// =============================================================================
 import { useEffect, useRef, useState } from "react";
 import { api, type IngestResult, type Post } from "../api";
 import { Badge, Dir, Ret, day, when } from "../format";
 
+// Clickable example posts, each one exercising a tricky case (options, sarcasm, a question...).
 const EXAMPLES = [
   "Loading up on $NVDA here, datacenter demand isn't slowing. 200 by March.",
   "Grabbed some TSLA puts before deliveries, they're going to disappoint",
@@ -21,11 +33,15 @@ export default function Submit() {
   const [post, setPost] = useState<Post | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // useRef = a box that survives re-draws WITHOUT causing one. Holds the polling timer's id.
   const timer = useRef<number | null>(null);
 
+  // Cleanup only: if you leave the tab while polling, stop the timer.
   useEffect(() => () => { if (timer.current) window.clearInterval(timer.current); }, []);
 
   async function submit() {
+    // Reset the page, then send the post. crypto.randomUUID() makes a unique
+    // Idempotency-Key, so a network retry of THIS submit can't create a duplicate post.
     setError(null); setPost(null); setResult(null); setBusy(true);
     if (timer.current) window.clearInterval(timer.current);
     try {
@@ -36,6 +52,8 @@ export default function Submit() {
       });
       setResult(r);
       const started = Date.now();
+      // Ask for the post's latest state; stop once it's processed or after 120 s (120_000 ms;
+      // the underscore is just a digit separator for readability).
       const poll = async () => {
         const p = await api<Post>(`/api/posts/${r.post_id}`);
         setPost(p);
@@ -55,6 +73,8 @@ export default function Submit() {
   // index of the stage in progress; STAGES.length means everything finished
   const stage = !result ? -1 : !post ? 1 : post.status === "pending" ? 2 : STAGES.length;
 
+  // Left card: the form. Right card: the 4-stage progress list and the outcome.
+  // `{error && <div>...}` is the usual React idiom for "show this only if error is set".
   return (
     <section className="grid-2">
       <div className="card">
@@ -95,6 +115,9 @@ export default function Submit() {
   );
 }
 
+// The result panel: status badge, which model processed it (and whether the answer came
+// from the LLM cache), the pipeline's notes, and a table of the extracted ideas.
+// "entry: next scoring run" = the idea exists but hasn't been marked yet.
 function Outcome({ post }: { post: Post }) {
   const ex = post.extraction;
   const kind = post.status === "extracted" ? "ok" : post.status === "needs_review" ? "warn" : post.status === "failed" ? "bad" : "muted";

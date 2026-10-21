@@ -1,3 +1,23 @@
+# =============================================================================
+# queue/postgres_queue.py: A JOB QUEUE THAT IS JUST A POSTGRES TABLE (the default)
+# -----------------------------------------------------------------------------
+# The `jobs` table (models.py -> Job) is the queue:
+#   enqueue = INSERT a row with status 'pending'
+#   claim   = find a pending row, set it to 'running' + a lease deadline (one SQL statement)
+#   ack     = set it to 'done'
+#   fail    = set it back to 'pending' with available_at in the future (backoff),
+#             or 'dead' after max_attempts
+#
+# The clever bit is FOR UPDATE SKIP LOCKED. Picture 4 workers asking for a job at the
+# same moment:
+#   FOR UPDATE   -> the first worker locks the row it picked
+#   SKIP LOCKED  -> the other three don't wait for that lock; they skip that row and
+#                   take the next one. Result: no two workers ever get the same job,
+#                   and nobody blocks anybody.
+#
+# Why Postgres instead of Redis (we benchmarked both): enqueue can run inside the
+# SAME transaction that saves the post, so a post can never exist without its job.
+# =============================================================================
 """Postgres-backed job queue using SELECT ... FOR UPDATE SKIP LOCKED.
 
 Why this works for concurrency:
@@ -27,6 +47,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .base import JobQueue, Message, QueueStats
 
+# The claim, as ONE SQL statement. Read it in two halves:
+#   WITH claimable AS (...)  -- a CTE: a named sub-query. It picks up to :n job ids that
+#                               are (a) pending and due, or (b) "running" but whose lease
+#                               ran out (the worker died). Oldest first. Locks them,
+#                               skipping rows other workers have locked.
+#   UPDATE jobs ... RETURNING -- marks exactly those rows as ours: status running,
+#                               attempts+1, our worker id, lease = now + :lease seconds,
+#                               and returns them to Python.
+# Because it's one statement, "find a free job" and "take it" happen atomically.
 CLAIM_SQL = text(
     """
     WITH claimable AS (
@@ -54,16 +83,17 @@ CLAIM_SQL = text(
 
 class PostgresQueue(JobQueue):
     backend = "postgres"
-    transactional_enqueue = True
+    transactional_enqueue = True      # <- the property that removes the dual-write problem
 
     def __init__(self, session_factory: sessionmaker[Session], queue: str = "extract",
                  lease_seconds: int = 120, max_attempts: int = 5, poll_interval_s: float = 0.2):
         super().__init__(queue, lease_seconds, max_attempts)
         self._sf = session_factory
-        self._poll = poll_interval_s
+        self._poll = poll_interval_s      # how often to re-check for work when the queue is empty
 
     # ------------------------------------------------------------------ enqueue
     def enqueue(self, payload: dict[str, Any], *, session: Session | None = None) -> str:
+        # CAST(:p AS jsonb): we send the payload as a JSON string; Postgres stores it as JSONB.
         stmt = text(
             "INSERT INTO jobs (queue, payload, max_attempts) "
             "VALUES (:q, CAST(:p AS jsonb), :m) RETURNING id"
@@ -72,6 +102,7 @@ class PostgresQueue(JobQueue):
         if session is not None:
             # Same transaction as the caller's writes: both commit or neither does.
             return str(session.execute(stmt, params).scalar_one())
+        # No session given: open our own short transaction (sf.begin() commits on exit).
         with self._sf.begin() as s:
             return str(s.execute(stmt, params).scalar_one())
 
@@ -79,11 +110,14 @@ class PostgresQueue(JobQueue):
     def claim(self, worker_id: str, max_messages: int = 1, block_ms: int = 1000) -> list[Message]:
         # Postgres has no blocking pop, so we poll. (LISTEN/NOTIFY would remove the
         # polling delay; see docs/DESIGN_DECISIONS.md.)
-        deadline = time.monotonic() + block_ms / 1000
+        # Keep trying until we get a job or block_ms has passed. This polling is why
+        # Postgres p95 latency (~135 ms) is higher than Redis (~1 ms).
+        deadline = time.monotonic() + block_ms / 1000    # monotonic: a clock that never jumps backwards
         while True:
             msgs = self._claim_once(worker_id, max_messages)
             if msgs or time.monotonic() >= deadline:
                 return msgs
+            # Sleep 0.1-0.3 s. The random "jitter" stops all workers waking at the same instant.
             time.sleep(self._poll * (0.5 + random.random()))  # jitter avoids lockstep
 
     def _claim_once(self, worker_id: str, n: int) -> list[Message]:
@@ -94,11 +128,13 @@ class PostgresQueue(JobQueue):
             for row in rows:
                 if row.attempts > row.max_attempts:
                     # Its previous holder crashed on the final attempt: poison message.
+                    # (A "poison message" kills every worker that touches it; stop handing it out.)
                     s.execute(text(
                         "UPDATE jobs SET status='dead', finished_at=now(), "
                         "last_error=coalesce(last_error, 'lease expired on final attempt') "
                         "WHERE id=:id"), {"id": row.id})
                     continue
+                # receipt = the attempt number we claimed with (our fencing token).
                 out.append(Message(id=str(row.id), payload=row.payload,
                                    attempts=row.attempts, receipt=str(row.attempts)))
         return out
@@ -106,21 +142,26 @@ class PostgresQueue(JobQueue):
     # ---------------------------------------------------------------- ack/fail
     def ack(self, msg: Message) -> bool:
         with self._sf.begin() as s:
+            # "AND attempts=:fence": only succeed if nobody re-claimed the job since we
+            # got it. If our lease expired and another worker took it, attempts went up,
+            # this matches 0 rows, and we return False instead of overwriting their state.
             res = s.execute(text(
                 "UPDATE jobs SET status='done', finished_at=now(), lease_until=NULL "
                 "WHERE id=:id AND attempts=:fence AND status='running'"),
                 {"id": int(msg.id), "fence": int(msg.receipt)})
-            return res.rowcount == 1
+            return res.rowcount == 1        # rowcount = how many rows the UPDATE changed
 
     def fail(self, msg: Message, error: str) -> bool:
-        dead = msg.attempts >= self.max_attempts
+        dead = msg.attempts >= self.max_attempts      # was that the last allowed try?
         with self._sf.begin() as s:
             if dead:
+                # Give up: move to the dead-letter pile (shown on the System tab).
                 s.execute(text(
                     "UPDATE jobs SET status='dead', finished_at=now(), last_error=:e, "
                     "lease_until=NULL WHERE id=:id AND attempts=:fence"),
                     {"id": int(msg.id), "fence": int(msg.receipt), "e": error[:2000]})
             else:
+                # Retry later: back to pending, but not available until now + backoff.
                 s.execute(text(
                     "UPDATE jobs SET status='pending', last_error=:e, lease_until=NULL, "
                     "available_at = now() + make_interval(secs => :delay) "
@@ -129,6 +170,8 @@ class PostgresQueue(JobQueue):
                      "delay": self.backoff_seconds(msg.attempts)})
         return dead
 
+    # For very long jobs: "I'm still working, push my deadline out". (Our LLM calls are
+    # much shorter than the 120 s lease, so the worker doesn't currently need it.)
     def extend_lease(self, msg: Message) -> bool:
         with self._sf.begin() as s:
             res = s.execute(text(
@@ -138,6 +181,8 @@ class PostgresQueue(JobQueue):
             return res.rowcount == 1
 
     # ------------------------------------------------------------ observability
+    # One query that counts jobs in each state. `count(*) FILTER (WHERE ...)` counts only
+    # matching rows, so we get all the counts in a single pass over the table.
     def stats(self) -> QueueStats:
         with self._sf() as s:
             row = s.execute(text(
@@ -152,12 +197,14 @@ class PostgresQueue(JobQueue):
                                                                                     AS oldest
                 FROM jobs WHERE queue = :q
                 """), {"q": self.queue}).one()
+        # Expired leases count as "pending": they'll be picked up again.
         return QueueStats(backend=self.backend, queue=self.queue,
                           pending=row.pending + row.expired, in_flight=row.in_flight,
                           dead=row.dead, done=row.done,
                           oldest_pending_age_s=float(row.oldest) if row.oldest else None,
                           extra={"expired_leases": row.expired})
 
+    # The most recent dead jobs, for the System tab's "dead letters" table.
     def dead_letters(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._sf() as s:
             rows = s.execute(text(
@@ -168,6 +215,7 @@ class PostgresQueue(JobQueue):
                  "error": r.last_error, "at": r.finished_at.isoformat() if r.finished_at else None}
                 for r in rows]
 
+    # Housekeeping, run daily by the scheduler: delete 'done' jobs older than 7 days.
     def cleanup(self, older_than_days: int = 7) -> int:
         """Delete finished jobs past retention so the table (and its indexes) stay small.
         Dead jobs are kept: they're the audit trail of what failed."""
@@ -183,5 +231,7 @@ class PostgresQueue(JobQueue):
             s.execute(text("DELETE FROM jobs WHERE queue=:q"), {"q": self.queue})
 
 
+# dict -> compact JSON string. default=str: anything JSON can't encode (like a date)
+# is converted with str() instead of crashing.
 def _json(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), default=str)

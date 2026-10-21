@@ -1,3 +1,24 @@
+# =============================================================================
+# worker.py: THE BACKGROUND WORKER: TAKE A JOB, PROCESS THE POST, SAVE, REPEAT
+# -----------------------------------------------------------------------------
+# One worker = one loop running forever (in its own thread, or its own process):
+#
+#   run_forever -> run_once -> (wait for rate-limit token) -> claim job -> _handle
+#                                                                         -> process
+#   process:  1. quick read: load the post; skip if no longer "pending"
+#             2. slow part:  pipeline.run(text)  (the LLM call; no DB transaction open)
+#             3. quick write: lock the post row, re-check "pending", save outcome + ideas
+#   _handle:  success -> queue.ack ;  exception -> queue.fail (retry with backoff,
+#             or dead-letter after 5 attempts and mark the post "failed")
+#
+# Why "no transaction during the LLM call": a DB transaction holds locks and a
+# connection. Holding them for 3-10 seconds per LLM call would starve the API.
+# Why "re-check under a row lock": if the same job was delivered twice (at-least-once),
+# the second worker sees status != pending and does nothing. That's idempotency.
+#
+# Started by: runtime.start_workers() (embedded in the API on Render) or
+#             `python -m tally worker` (separate process).
+# =============================================================================
 """Extraction worker: claim job -> extract -> persist -> ack.
 
 The important properties, and where they come from:
@@ -33,18 +54,22 @@ from .queue import JobQueue, Message
 log = logging.getLogger(__name__)
 
 
+# Save the extracted ideas for a post. Used by the worker AND by review.py (approve).
+# effective_at = the time used to pick the entry price (received time, or approval time).
+# Returns how many NEW ideas were inserted.
 def insert_ideas(s: Session, post: RawPost, candidates: list[IdeaCandidate], *,
                  extractor: str, prompt_version: str | None, effective_at: dt.datetime) -> int:
     n = 0
     for c in candidates:
         if not c.ticker:
-            continue
+            continue                      # an unresolved idea can't be scored; skip it
         res = s.execute(pg_insert(TradeIdea).values(
             post_id=post.id, contributor_id=post.contributor_id, ticker=c.ticker,
             direction=c.direction, horizon_days=c.horizon_days, horizon_inferred=c.horizon_inferred,
             target_price=c.target_price, conviction=c.conviction, confidence=c.confidence,
             rationale=c.rationale, received_at=post.received_at, effective_at=effective_at,
             extractor=extractor, prompt_version=prompt_version,
+        # UNIQUE(post_id, ticker): if this idea already exists, do nothing (idempotency).
         ).on_conflict_do_nothing(constraint="uq_idea_post_ticker").returning(TradeIdea.id))
         n += res.scalar() is not None   # None = conflict, the idea already existed
     return n
@@ -57,24 +82,30 @@ class ExtractionWorker:
         self.queue = queue
         self.pipeline = pipeline
         self.sf = session_factory
+        # A unique name: machine name + process id + 6 random hex chars, e.g. "srv-12-a1b2c3".
         self.worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
         self.limiter = limiter
+        # threading.Event = a shared on/off flag. Setting it tells the loop to stop (shutdown).
         self.stop = stop_event or threading.Event()
-        self.processed = 0
+        self.processed = 0               # counters shown on the System tab
         self.failed = 0
         self.started_at = dt.datetime.now(dt.timezone.utc)
         self._last_beat = 0.0
 
     # ----------------------------------------------------------------- loop
+    # Loop until told to stop. block_ms=2000: each claim waits up to 2 s for a job.
     def run_forever(self) -> None:
         log.info("worker %s started (queue=%s)", self.worker_id, self.queue.backend)
         while not self.stop.is_set():
             self.run_once(block_ms=2000)
         log.info("worker %s stopped", self.worker_id)
 
+    # One iteration. Separate from run_forever so tests can step through one job at a time.
     def run_once(self, block_ms: int = 0) -> int:
         """Claim and process at most one message. Returns number processed (0 or 1)."""
         self._heartbeat()
+        # Get LLM quota FIRST. If we claimed first and then waited, we'd sit on a lease
+        # doing nothing, and it could expire.
         if self.limiter and not self.limiter.acquire(timeout=5, stop=self.stop):
             return 0
         try:
@@ -82,10 +113,10 @@ class ExtractionWorker:
         except Exception:  # noqa: BLE001 - e.g. DB/Redis briefly unavailable
             log.exception("claim failed")
             if self.limiter:
-                self.limiter.refund()
-            self.stop.wait(2)
+                self.limiter.refund()        # didn't use the token: give it back
+            self.stop.wait(2)                # pause 2 s (or until shutdown) before trying again
             return 0
-        if not msgs:
+        if not msgs:                         # queue empty
             if self.limiter:
                 self.limiter.refund()
             return 0
@@ -94,31 +125,36 @@ class ExtractionWorker:
         self._heartbeat(every_s=2.0)   # surface progress promptly on the System page
         return len(msgs)
 
+    # Process one message, and report the outcome to the queue (ack or fail).
     def _handle(self, msg: Message) -> None:
         try:
             result = self.process(msg)
             if result == "skipped" and self.limiter:
                 self.limiter.refund()   # duplicate job: no LLM call was made
             if not self.queue.ack(msg):
+                # Our lease expired and someone else re-claimed the job (fencing said no).
+                # Harmless thanks to idempotency, but worth a log line.
                 log.warning("lost lease on %s before ack; another worker owns it", msg.id)
             self.processed += 1
         except Exception as e:  # noqa: BLE001 - every failure goes through the retry path
             self.failed += 1
             err = f"{type(e).__name__}: {e}"
-            dead = self.queue.fail(msg, err)
+            dead = self.queue.fail(msg, err)      # retry later, or dead-letter
             log.warning("job %s attempt %d failed (%s)%s", msg.id, msg.attempts, err,
                         " -> dead-lettered" if dead else "")
             if dead:
                 self._mark_post_failed(msg.payload.get("post_id"), err)
 
     # -------------------------------------------------------------- the job
+    # Returns the post's new status, or "skipped" for a duplicate/stale job.
     def process(self, msg: Message) -> str:
         post_id = int(msg.payload["post_id"])
         # 1) short read transaction
         with self.sf() as s:
-            post = s.get(RawPost, post_id)
+            post = s.get(RawPost, post_id)            # look up by primary key
             if post is None or post.status != "pending":
                 return "skipped"
+            # Copy what we need out of the session before it closes.
             text, when = post.text, post.posted_at or post.received_at
 
         # 2) slow part, no transaction open
@@ -126,23 +162,29 @@ class ExtractionWorker:
 
         # 3) short write transaction, re-checking state under a row lock
         with session_scope(self.sf) as s:
+            # SELECT ... FOR UPDATE: lock the row. Another worker trying the same post
+            # waits here until we commit; then it sees our new status and skips.
             post = s.execute(select(RawPost).where(RawPost.id == post_id).with_for_update()).scalar_one()
             if post.status != "pending":
                 return "skipped"   # a concurrent duplicate got here first
             self._apply_outcome(s, post, outcome)
         return outcome.status
 
+    # Copy the outcome onto the post row, and insert ideas if extracted.
     @staticmethod
     def _apply_outcome(s: Session, post: RawPost, outcome: ExtractionOutcome) -> None:
         post.status = outcome.status
-        post.extraction = outcome.to_json()
+        post.extraction = outcome.to_json()       # full details, shown on the Review tab
         post.extractor = outcome.extractor
         post.processed_at = dt.datetime.now(dt.timezone.utc)
         post.error = None
         if outcome.status == "extracted":
+            # Auto-accepted ideas enter at the time WE RECEIVED the post.
             insert_ideas(s, post, outcome.ideas, extractor=outcome.extractor,
                          prompt_version=outcome.prompt_version, effective_at=post.received_at)
 
+    # After the final failed attempt: mark the post "failed" so it shows up in the UI
+    # (and can be re-queued later with "retry failed").
     def _mark_post_failed(self, post_id: int | None, err: str) -> None:
         if post_id is None:
             return
@@ -156,6 +198,8 @@ class ExtractionWorker:
             log.exception("could not mark post %s failed", post_id)
 
     # ----------------------------------------------------------- heartbeat
+    # At most every `every_s` seconds, upsert "I'm alive" into worker_heartbeats.
+    # Best-effort: if the database hiccups, we just skip this beat.
     def _heartbeat(self, every_s: float = 15.0) -> None:
         import time
         now = time.monotonic()
@@ -169,6 +213,7 @@ class ExtractionWorker:
                     worker_id=self.worker_id, queue_backend=self.queue.backend,
                     started_at=self.started_at, last_seen=ts,
                     processed=self.processed, failed=self.failed)
+                # Insert the first time; afterwards update last_seen and the counters.
                 s.execute(stmt.on_conflict_do_update(
                     index_elements=["worker_id"],
                     set_={"last_seen": ts, "processed": self.processed, "failed": self.failed}))

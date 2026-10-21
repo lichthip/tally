@@ -1,3 +1,20 @@
+# =============================================================================
+# tools/bench.py: THE QUEUE BENCHMARK (Postgres vs Redis, same workload)
+# -----------------------------------------------------------------------------
+# Produces the numbers in docs/benchmarks.md. For each backend:
+#   1. ENQUEUE throughput: add N jobs as fast as possible -> jobs/second
+#   2. DRAIN throughput:   W worker threads empty the queue -> jobs/second
+#      (optionally "crashing" some workers before they ack, to prove recovery)
+#   3. LATENCY: add jobs at a steady 200/s while workers consume; measure time from
+#      enqueue to ack for each job -> p50 / p95 / p99
+#
+# The crash test is the important one: with --crash-rate 0.05, 5% of first deliveries
+# do the work and then "die" without acking. We check every job still completes (the
+# lease expires, the job is redelivered) and count how many ran TWICE: at-least-once
+# delivery, measured.
+#
+# Run: python -m tally bench --crash-rate 0.05 --out ../docs/benchmarks.md
+# =============================================================================
 """Queue benchmark: Postgres (SKIP LOCKED) vs Redis Streams on identical workloads.
 
 Three phases per backend:
@@ -17,11 +34,13 @@ import random
 import statistics
 import threading
 import time
-from collections import Counter
+from collections import Counter     # a dict that counts things: c["x"] += 1
 
 from ..queue import build_queue
 
 
+# Percentile: sort the values and pick the one p% of the way along.
+# _pct(latencies, 95) = the value that 95% of measurements are at or below.
 def _pct(xs: list[float], p: float) -> float:
     if not xs:
         return float("nan")
@@ -30,6 +49,7 @@ def _pct(xs: list[float], p: float) -> float:
     return xs[k]
 
 
+# Run `n_workers` threads that claim and ack jobs until `target` distinct jobs are done.
 def _consume(q, n_workers: int, target: int, work_ms: float, crash_rate: float,
              timeout_s: float, seed: int = 1):
     """Workers run until `target` distinct jobs are ACKED.
@@ -39,11 +59,11 @@ def _consume(q, n_workers: int, target: int, work_ms: float, crash_rate: float,
     redelivered and executed again. `executions` counts side effects, so
     executions - unique jobs = duplicate executions = why handlers must be idempotent.
     """
-    executions: Counter = Counter()
-    acked: set = set()
+    executions: Counter = Counter()      # job number -> how many times it was executed
+    acked: set = set()                   # job numbers successfully acked
     latencies: list[float] = []
-    crashed = [0]
-    lock = threading.Lock()
+    crashed = [0]                        # a list so inner functions can modify it
+    lock = threading.Lock()              # threads share the counters above
     done = threading.Event()
 
     def worker(i: int) -> None:
@@ -53,10 +73,11 @@ def _consume(q, n_workers: int, target: int, work_ms: float, crash_rate: float,
             msgs = q.claim(wid, max_messages=10, block_ms=200)
             for m in msgs:
                 if work_ms:
-                    time.sleep(work_ms / 1000)
+                    time.sleep(work_ms / 1000)         # pretend to do some work
                 k = m.payload["k"]
                 with lock:
                     executions[k] += 1                 # side effect has happened
+                # Simulate a crash: only on a FIRST delivery, with probability crash_rate.
                 if crash_rate and m.attempts == 1 and rng.random() < crash_rate:
                     with lock:
                         crashed[0] += 1
@@ -66,12 +87,12 @@ def _consume(q, n_workers: int, target: int, work_ms: float, crash_rate: float,
                 with lock:
                     if k not in acked:
                         acked.add(k)
-                        latencies.append(now - m.payload["t"])
+                        latencies.append(now - m.payload["t"])    # t = when it was enqueued
                     if len(acked) >= target:
                         done.set()
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(n_workers)]
-    t0 = time.perf_counter()
+    t0 = time.perf_counter()             # high-resolution timer
     for t in threads:
         t.start()
     done.wait(timeout_s)
@@ -82,9 +103,10 @@ def _consume(q, n_workers: int, target: int, work_ms: float, crash_rate: float,
     return executions, acked, latencies, crashed[0], elapsed
 
 
+# All three phases for one backend. Returns a dict of results (one column of the table).
 def run_bench(backend: str, jobs: int, workers: int, work_ms: float, crash_rate: float,
               lease: int, steady_rate: float = 200.0, steady_jobs: int = 600) -> dict:
-    q = build_queue(backend, queue="bench", lease_seconds=lease)
+    q = build_queue(backend, queue="bench", lease_seconds=lease)   # a separate "bench" queue
     q.purge()
     res: dict = {"backend": backend, "jobs": jobs, "workers": workers, "work_ms": work_ms,
                  "crash_rate": crash_rate, "lease_s": lease}
@@ -102,13 +124,14 @@ def run_bench(backend: str, jobs: int, workers: int, work_ms: float, crash_rate:
     res["completed_unique"] = len(acked)
     res["all_completed"] = len(acked) == jobs
     res["crashed_deliveries"] = crashed
-    res["duplicate_completions"] = sum(execs.values()) - len(execs)
+    res["duplicate_completions"] = sum(execs.values()) - len(execs)    # total runs - distinct jobs
     res["drain_seconds"] = elapsed
     q.purge()
 
     # 3) steady-state latency (no crashes)
     stop = threading.Event()
 
+    # Adds jobs at a fixed rate (e.g. one every 5 ms for 200/s).
     def producer() -> None:
         interval = 1.0 / steady_rate
         nxt = time.perf_counter()
@@ -122,7 +145,7 @@ def run_bench(backend: str, jobs: int, workers: int, work_ms: float, crash_rate:
     pt.start()
     _, _, lat2, _, _ = _consume(q, workers, steady_jobs, work_ms, 0.0, timeout_s=120)
     pt.join(5)
-    lat_ms = [x * 1000 for x in lat2]
+    lat_ms = [x * 1000 for x in lat2]          # seconds -> milliseconds
     res.update({"steady_rate_per_s": steady_rate, "latency_p50_ms": _pct(lat_ms, 50),
                 "latency_p95_ms": _pct(lat_ms, 95), "latency_p99_ms": _pct(lat_ms, 99),
                 "latency_mean_ms": statistics.fmean(lat_ms) if lat_ms else float("nan")})
@@ -130,6 +153,7 @@ def run_bench(backend: str, jobs: int, workers: int, work_ms: float, crash_rate:
     return res
 
 
+# Results -> the markdown table in docs/benchmarks.md.
 def to_markdown(results: list[dict]) -> str:
     rows = [
         ("Enqueue throughput (jobs/s)", "enqueue_per_s", "{:,.0f}"),

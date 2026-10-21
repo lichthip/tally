@@ -1,14 +1,24 @@
+// =============================================================================
+// pages/Ideas.tsx: THE IDEAS TAB (the append-only idea log)
+// -----------------------------------------------------------------------------
+// GET /api/ideas with optional filters (status, ticker, include simulated). One row per
+// idea: when it became effective, who, ticker, direction, horizon, entry date/price,
+// latest mark, stock return, benchmark return, EXCESS return, and mark status.
+// "unmarked" = the idea is saved but no scoring run has marked it yet.
+// =============================================================================
 import { useState } from "react";
 import type { Idea } from "../api";
 import { Badge, Dir, Ret, day, num } from "../format";
 import { useApi } from "../useApi";
 
+// Mark status -> badge colour.
 const STATUS_KIND: Record<string, string> = { closed: "ok", open: "info", pending_entry: "muted", unscorable: "warn" };
 
 export default function Ideas() {
   const [status, setStatus] = useState("");
   const [ticker, setTicker] = useState("");
-  const [sim, setSim] = useState(false);
+  const [sim, setSim] = useState(false);     // simulated ideas hidden by default (they'd swamp real ones)
+  // Build the query string, e.g. "limit=200&include_simulated=false&ticker=NVDA".
   const qs = new URLSearchParams({ limit: "200", include_simulated: String(sim) });
   if (status) qs.set("mark_status", status);
   if (ticker) qs.set("ticker", ticker);

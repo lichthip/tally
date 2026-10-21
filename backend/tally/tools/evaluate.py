@@ -1,3 +1,17 @@
+# =============================================================================
+# tools/evaluate.py: THE EXTRACTION EXAM (is the LLM actually better than keywords?)
+# -----------------------------------------------------------------------------
+# 48 posts I labelled by hand (data/eval_posts.jsonl), each with the right answer and
+# tags like "sarcasm" or "options". We run the configured extractor on every post,
+# compare with the right answer, and compute:
+#   precision = of the posts it CALLED ideas, how many really were?  (false alarms hurt it)
+#   recall    = of the REAL ideas, how many did it find?             (misses hurt it)
+#   fully correct = idea/no-idea right AND tickers right AND directions right
+#   per tag   = which kinds of posts it gets right or wrong
+# Output: the markdown tables in docs/eval.md and docs/eval_llm.md.
+#
+# Run: python -m tally eval --out ../docs/eval_llm.md   (uses whatever LLM .env configures)
+# =============================================================================
 """Extraction eval: how often does the extractor get it right, and where does it fail?
 
 A hand-labelled set of posts (tally/data/eval_posts.jsonl) covers the known hard cases:
@@ -24,19 +38,25 @@ from ..extraction.symbols import normalise_ticker
 from ..extraction.types import RawExtraction
 
 DATA = Path(__file__).resolve().parent.parent / "data" / "eval_posts.jsonl"
+# Every eval post pretends to be posted at this fixed time, so "by March" always resolves
+# the same way and the results are reproducible.
 POSTED_AT = dt.datetime(2026, 10, 1, 12, 0, tzinfo=dt.timezone.utc)
 
 
+# JSONL = one JSON object per line. Returns a list of dicts like
+# {"id": 4, "text": "...", "is_idea": true, "ideas": [...], "tags": ["options"]}.
 def load_cases(path: Path = DATA) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
+# Some labels accept several tickers (Tencent = 0700.HK or TCEHY). True if `got` is one of them.
 def _accepts(expected_ticker, got: str | None) -> bool:
     options = expected_ticker if isinstance(expected_ticker, list) else [expected_ticker]
     return got in options
 
 
+# Run the extractor on one text and simplify the answer to (is_idea, [(ticker, direction)], error).
 def predict(extractor, resolver, text: str) -> tuple[bool, list[tuple[str | None, str]], str | None]:
     """Returns (is_idea, [(ticker, direction)], error)."""
     try:
@@ -46,7 +66,7 @@ def predict(extractor, resolver, text: str) -> tuple[bool, list[tuple[str | None
     except LLMPermanentError:
         raise   # bad key / unknown model: every case would fail the same way, so stop now
     except (LLMError, ValueError) as e:
-        return False, [], f"{type(e).__name__}: {e}"
+        return False, [], f"{type(e).__name__}: {e}"     # counts as a wrong answer, error noted
     ideas = []
     for i in parsed.ideas:
         t, _ = resolver.resolve(i.ticker, i.company_name)
@@ -54,6 +74,7 @@ def predict(extractor, resolver, text: str) -> tuple[bool, list[tuple[str | None
     return parsed.is_trade_idea and bool(ideas), ideas, None
 
 
+# Retry provider hiccups up to 3 times, waiting 2 s then 4 s.
 def _extract_with_retry(extractor, text: str, attempts: int = 3) -> dict:
     """Provider hiccups (500s, timeouts) say nothing about extraction quality, so retry
     them, the same way the production queue would, instead of scoring them as wrong."""
@@ -62,21 +83,24 @@ def _extract_with_retry(extractor, text: str, attempts: int = 3) -> dict:
             return extractor.extract(text, POSTED_AT)
         except LLMTransientError:
             if i == attempts - 1:
-                raise
+                raise                     # out of attempts: give up
             time.sleep(2 ** (i + 1))
     raise AssertionError("unreachable")
 
 
+# Grade one post: was "idea vs not" right? Were the tickers and directions right?
 def score_case(case: dict, is_idea: bool, ideas: list[tuple[str | None, str]]) -> dict:
     exp = case["ideas"]
     res = {"idea_correct": is_idea == case["is_idea"], "tickers_correct": None, "directions_correct": None}
     if case["is_idea"] and is_idea:
         matched, dir_ok = 0, 0
         for e in exp:
+            # next(..., None): the first predicted idea with an acceptable ticker, or None.
             hit = next((d for t, d in ideas if _accepts(e["ticker"], t)), None)
             if hit is not None:
                 matched += 1
                 dir_ok += hit == e["direction"]
+        # All expected tickers found AND no extra ones (that's how #46 MSTR+BTC "failed").
         res["tickers_correct"] = matched == len(exp) and len(ideas) == len(exp)
         res["directions_correct"] = dir_ok == len(exp)
     res["fully_correct"] = res["idea_correct"] and (not case["is_idea"] or
@@ -86,6 +110,9 @@ def score_case(case: dict, is_idea: bool, ideas: list[tuple[str | None, str]]) -
 
 def run_eval(extractor, resolver, limiter=None, limit: int | None = None) -> dict:
     cases = load_cases()[:limit] if limit else load_cases()
+    # Confusion-matrix counters for "is it an idea?":
+    #   tp = said idea, was idea   fp = said idea, wasn't (false alarm)
+    #   fn = said no, was idea (miss)   tn = said no, wasn't
     tp = fp = fn = tn = 0
     tick_ok = tick_n = dir_ok = 0
     full = 0
@@ -94,11 +121,12 @@ def run_eval(extractor, resolver, limiter=None, limit: int | None = None) -> dic
     failures = []
     for case in cases:
         if limiter is not None:
-            limiter.acquire()
+            limiter.acquire()             # respect the LLM rate limit
         is_idea, ideas, err = predict(extractor, resolver, case["text"])
         if err and "Transient" in err:
             infra_errors += 1
         s = score_case(case, is_idea, ideas)
+        # Booleans add as 1/0: `tp += A and B` adds 1 when both are True.
         tp += case["is_idea"] and is_idea
         fp += (not case["is_idea"]) and is_idea
         fn += case["is_idea"] and not is_idea
@@ -130,8 +158,9 @@ def run_eval(extractor, resolver, limiter=None, limit: int | None = None) -> dic
     }
 
 
+# Format the results as the markdown tables you see in docs/eval*.md.
 def to_markdown(r: dict) -> str:
-    pct = lambda x: "n/a" if x is None else f"{x:.0%}"  # noqa: E731
+    pct = lambda x: "n/a" if x is None else f"{x:.0%}"  # noqa: E731   (0.96 -> "96%")
     out = [f"## Extractor `{r['extractor']}` ({r['n']} labelled posts)\n",
            "| Metric | Value |", "|---|---|",
            f"| Fully correct | **{pct(r['fully_correct'])}** |",

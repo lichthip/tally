@@ -1,14 +1,25 @@
+// =============================================================================
+// pages/SourcesCard.tsx: THE "SOURCES" CARD ON THE SYSTEM TAB
+// -----------------------------------------------------------------------------
+// Pick a source type (Reddit / Substack / StockTwits / Other RSS) and a target, then:
+//   Preview (free) -> POST /api/sources/preview : fetch + keep/drop labels; saves nothing, no LLM
+//   Ingest         -> POST /api/sources/ingest  : fetch, pre-filter, save + queue the kept posts
+// Ingest stays disabled until you've previewed, so you always know what you're about to
+// spend LLM calls on.
+// =============================================================================
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { Badge } from "../format";
 import { useApi } from "../useApi";
 
+// Shapes of what the three endpoints return.
 type Kind = "reddit" | "substack" | "stocktwits" | "rss";
 type SourcesInfo = { scheduled: string[]; suggested: Record<Kind, string[]>; poll_interval_minutes: number };
 type PreviewItem = { author: string; text: string; url: string | null; keep: boolean; author_sentiment: string | null };
 type Preview = { source: string; fetched: number; kept: number; items: PreviewItem[] };
 type IngestReport = { source: string; new: number; duplicate: number; filtered: number; errors: number };
 
+// The four buttons: what to call the target box, and a one-line explanation of each.
 const KINDS: { id: Kind; label: string; targetLabel: string; why: string }[] = [
   { id: "reddit", label: "Reddit", targetLabel: "subreddit",
     why: "Forum posts, read through Reddit's public RSS feed (its JSON API now blocks anonymous access)." },
@@ -37,6 +48,7 @@ export default function SourcesCard() {
     setTarget(data?.suggested[kind]?.[0] ?? ""); setPreview(null); setReport(null); setErr(null);
   }, [kind, data]);
 
+  // One function for both buttons: same request body, different endpoint and result slot.
   async function run(path: "preview" | "ingest") {
     setBusy(true); setErr(null); setReport(null);
     try {

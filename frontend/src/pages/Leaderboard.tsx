@@ -1,3 +1,11 @@
+// =============================================================================
+// pages/Leaderboard.tsx: THE LEADERBOARD TAB
+// -----------------------------------------------------------------------------
+// GET /api/leaderboard?sort=...&include_simulated=... and show one row per contributor:
+// closed/open counts, hit rate, RAW mean excess, SHRUNK skill estimate, a 95% interval
+// bar, and P(skill > 0). Switching "rank by" between raw and shrunk is the demo moment:
+// small-sample accounts drop once shrinkage is applied.
+// =============================================================================
 import { useState } from "react";
 import type { LeaderRow } from "../api";
 import { Badge, Ret, num, pct } from "../format";
@@ -6,8 +14,11 @@ import { useApi } from "../useApi";
 export default function Leaderboard() {
   const [sort, setSort] = useState("shrunk");
   const [sim, setSim] = useState(true);
+  // Changing sort or sim changes the URL string, so useApi re-fetches automatically.
   const { data, error, loading } = useApi<LeaderRow[]>(`/api/leaderboard?sort=${sort}&include_simulated=${sim}`);
 
+  // The widest interval end (in absolute value) across all rows, so every bar uses the
+  // same scale. flatMap = map then flatten; ...array spreads the values into Math.max.
   const span = Math.max(0.01, ...(data ?? []).flatMap((r) => (r.ci95 ? [Math.abs(r.ci95[0]), Math.abs(r.ci95[1])] : [])));
 
   return (
@@ -61,9 +72,13 @@ export default function Leaderboard() {
   );
 }
 
+// A tiny chart drawn with plain divs: a zero line in the middle, a coloured range from
+// the interval's low to high end, and a dot at the estimate. If the range doesn't cross
+// zero, we're fairly sure about the skill's sign.
 function CiBar({ ci, mean, span }: { ci: [number, number] | null; mean: number | null; span: number }) {
   if (!ci || mean === null) return <span className="muted">—</span>;
-  const x = (v: number) => 50 + (Math.max(-span, Math.min(span, v)) / span) * 50;
+  // Map a value in [-span, +span] to a CSS left-position in [0%, 100%] (0 -> 50%, the centre).
+  const x =(v: number) => 50 + (Math.max(-span, Math.min(span, v)) / span) * 50;
   return (
     <div className="ci">
       <div className="ci-zero" />

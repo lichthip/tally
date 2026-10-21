@@ -1,3 +1,15 @@
+# =============================================================================
+# __main__.py: THE COMMAND LINE (python -m tally <command>)
+# -----------------------------------------------------------------------------
+# `python -m tally` runs this file (a package's __main__.py is its "run me" file).
+# argparse turns the words you type into an `args` object:
+#     python -m tally poll --substack stocksunderrocks --dry-run
+#     -> args.cmd == "poll", args.substack == "stocksunderrocks", args.dry_run == True
+# Then a chain of `if args.cmd == ...` blocks runs the matching code.
+#
+# Most commands build a Runtime (the same object the web server uses), so the CLI and
+# the API share all the logic and only the "front door" differs.
+# =============================================================================
 """Command line entry point:  python -m tally <command>
 
   serve        run the API (uvicorn)
@@ -19,30 +31,32 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import signal
+import signal        # lets us react to Ctrl+C (SIGINT) and to "please stop" from the OS (SIGTERM)
 import sys
 
 
 def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)   # silence a line per HTTP request
 
 
+# Pretty-print any result as indented JSON in the terminal.
 def _print(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
 
 
 def main(argv: list[str] | None = None) -> int:
+    # ---- 1. Define the commands and their options ---------------------------
     p = argparse.ArgumentParser(prog="tally", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-v", "--verbose", action="store_true")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("-v", "--verbose", action="store_true")      # store_true: a flag, True if present
+    sub = p.add_subparsers(dest="cmd", required=True)           # the command word goes into args.cmd
 
     sp = sub.add_parser("serve")
     sp.add_argument("--host", default="127.0.0.1")
     sp.add_argument("--port", type=int, default=8000)
-    sp.add_argument("--reload", action="store_true")
+    sp.add_argument("--reload", action="store_true")            # auto-restart when code changes (dev)
 
     sp = sub.add_parser("worker")
     sp.add_argument("--concurrency", type=int, default=None)
@@ -50,10 +64,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("scheduler")
     sub.add_parser("init-db")
     sp = sub.add_parser("reset-db")
-    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--yes", action="store_true")               # safety: must confirm explicitly
 
     sp = sub.add_parser("submit")
-    sp.add_argument("text")
+    sp.add_argument("text")                                     # positional: the post text itself
     sp.add_argument("--author", default="cli_user")
 
     sub.add_parser("score")
@@ -77,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check-llm")
 
     sp = sub.add_parser("reprocess")
-    sp.add_argument("post_ids", type=int, nargs="+")
+    sp.add_argument("post_ids", type=int, nargs="+")            # nargs="+": one or more numbers
 
     sp = sub.add_parser("bench")
     sp.add_argument("--backend", choices=["postgres", "redis", "both"], default="both")
@@ -91,11 +105,14 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     _setup_logging(args.verbose)
 
+    # Imported here (not at the top) so `python -m tally --help` stays fast and works
+    # even without a database.
     from .config import get_settings
     from .db import init_db
 
     st = get_settings()
 
+    # ---- 2. Commands that DON'T need the Runtime ----------------------------
     if args.cmd == "serve":
         import uvicorn
         uvicorn.run("tally.api.main:app", host=args.host, port=args.port, reload=args.reload)
@@ -116,9 +133,10 @@ def main(argv: list[str] | None = None) -> int:
         from .models import Base
         eng = get_engine()
         with eng.begin() as c:
+            # The trigger must go first, or dropping trade_ideas would be blocked... by our own rule.
             c.execute(text("DROP TRIGGER IF EXISTS trade_ideas_append_only ON trade_ideas"))
-        Base.metadata.drop_all(eng)
-        init_db()
+        Base.metadata.drop_all(eng)       # drop every table
+        init_db()                         # recreate them empty
         print("database reset")
         return 0
 
@@ -130,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         from .tools.bench import run_bench_cli
         return run_bench_cli(args)
 
+    # ---- 3. Everything else needs the full Runtime --------------------------
     init_db()
     from .runtime import Runtime
     rt = Runtime(st)
@@ -137,9 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "worker":
         n = args.concurrency or st.worker_concurrency
         rt.start_workers(n)
+        # On Ctrl+C or a stop signal: set the stop flag (lambda *_ = ignore the arguments).
         signal.signal(signal.SIGINT, lambda *_: rt.stop.set())
         signal.signal(signal.SIGTERM, lambda *_: rt.stop.set())
         print(f"{n} worker thread(s) running on {rt.queue.backend} queue with {rt.extractor.id}. Ctrl+C to stop.")
+        # Keep the main thread alive (checking once a second) until stop is set.
         while not rt.stop.wait(1):
             pass
         rt.shutdown()
@@ -148,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "scheduler":
         signal.signal(signal.SIGINT, lambda *_: rt.stop.set())
         signal.signal(signal.SIGTERM, lambda *_: rt.stop.set())
-        rt.scheduler_loop()
+        rt.scheduler_loop()               # runs in this thread until stopped
         return 0
 
     if args.cmd == "submit":
@@ -162,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "poll":
         from .sources import build_source
+        # No flag -> sources stays None -> rt.poll uses the .env sources.
         sources = None
         if args.subreddit:
             sources = [build_source("reddit", args.subreddit, args.limit)]
@@ -221,11 +243,13 @@ def _poll_dry_run(rt, sources) -> int:
             continue
         for i in r["items"]:
             tag = f" ({i['author_sentiment']})" if i["author_sentiment"] else ""
+            # {i['author']:<20} pads the name to 20 characters so the columns line up.
             print(f"  [{'KEEP' if i['keep'] else 'drop'}] {i['author']:<20}{tag} {i['text'][:80]!r}")
         print(f"  -> {r['fetched']} fetched, {r['kept']} would be ingested (= up to {r['kept']} LLM calls)")
     return 0
 
 
+# Checks the LLM setup: is the key valid, is the model available, does a test call work?
 def _check_llm(st) -> int:
     """No database needed: talks to the provider only."""
     import datetime as dt
@@ -237,7 +261,7 @@ def _check_llm(st) -> int:
         print("LLM_PROVIDER=rules: no LLM configured (set it to gemini, groq or openrouter in .env)")
         return 1
     try:
-        ex = build_extractor(st, None)
+        ex = build_extractor(st, None)        # None = no DB, so no cache
     except LLMError as e:
         print(f"configuration error: {e}")
         return 1
@@ -247,7 +271,7 @@ def _check_llm(st) -> int:
         models = ex.client.list_models()
         print(f"models available to this key ({len(models)}):")
         for m in models:
-            print(f"  {'*' if m == ex.client.model else ' '} {m}")
+            print(f"  {'*' if m == ex.client.model else ' '} {m}")    # * marks the configured one
         if models and ex.client.model not in models:
             print(f"\n!! '{ex.client.model}' is not in that list: set the model variable in .env to one of the above")
     except LLMError as e:
@@ -264,5 +288,7 @@ def _check_llm(st) -> int:
         return 1
 
 
+# True only when this file is run directly (python -m tally), not when it's imported.
+# sys.exit(code): 0 = success, anything else = error (scripts and CI read this).
 if __name__ == "__main__":
     sys.exit(main())

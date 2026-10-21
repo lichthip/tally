@@ -1,3 +1,13 @@
+# =============================================================================
+# sources/__init__.py: THE PACKAGE'S "FRONT DOOR"
+# -----------------------------------------------------------------------------
+# Any folder with an __init__.py is a Python *package*, so other code can write
+# `from tally.sources import RedditRSSSource`. Python runs this file the first time
+# anything imports from the package.
+# Here it re-exports the important names, so callers don't need to know which file
+# each class lives in (e.g. runtime.py writes `from .sources import build_source`).
+# __all__ lists the public names (what `from tally.sources import *` would give you).
+# =============================================================================
 """Sources: everything that brings posts into Tally.
 
 Naming convention: <Platform><Protocol>Source. The protocol says HOW we fetch

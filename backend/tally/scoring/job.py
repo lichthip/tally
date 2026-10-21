@@ -1,3 +1,20 @@
+# =============================================================================
+# scoring/job.py: THE SCORING RUN (glues marking + skill + signals to the database)
+# -----------------------------------------------------------------------------
+# run_scoring() does, in order:
+#   0. take a lock so only ONE scoring run happens at a time (anywhere)
+#   1. _mark_live_ideas:  every idea that isn't closed yet -> mark_idea() -> idea_marks
+#   2. _recompute_stats:  closed ideas per person -> estimate_skill() -> contributor_stats
+#   3. _rebuild_signals:  open ideas x weights -> build_signals() + risk -> signal_snapshots
+#   and records the run in scoring_runs (shown on the System tab).
+#
+# This file does the I/O (database reads/writes, fetching prices); the maths lives in
+# the pure files marking.py / skill.py / signals.py.
+#
+# Triggered by: the scheduler thread every 6h (runtime.scheduler_loop), the "Run
+# scoring now" button (POST /api/admin/score), `python -m tally score`, or the daily
+# GitHub Action.
+# =============================================================================
 """The scoring job: mark every live idea, re-estimate skill, rebuild signals.
 
 Runs on a schedule (embedded thread, CLI, or POST /admin/score). It is:
@@ -14,7 +31,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict    # a dict that creates a default value for missing keys
 
 from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -29,35 +46,40 @@ from .signals import build_signals, daily_returns, historical_risk, portfolio_we
 from .skill import contributor_weight, estimate_skill
 
 log = logging.getLogger(__name__)
-SCORING_LOCK_KEY = 7231002
+SCORING_LOCK_KEY = 7231002      # an arbitrary number naming "the scoring lock"
 
 
 def run_scoring(sf: sessionmaker[Session], store: PriceStore, *, now: dt.datetime | None = None,
                 normalisation_horizon: int = 20) -> dict:
-    now = now or dt.datetime.now(dt.timezone.utc)
+    now = now or dt.datetime.now(dt.timezone.utc)   # tests can pass a fixed "now"
     engine = sf.kw.get("bind") or get_engine()
+    # A dedicated connection that holds the lock for the whole run.
     with engine.connect() as lock_conn:
+        # pg_try_advisory_lock: take the lock if it's free -> True; if someone else holds
+        # it -> False immediately (no waiting). So a second run just skips.
         got = lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": SCORING_LOCK_KEY}).scalar()
         if not got:
             return {"skipped": True, "reason": "another scoring run holds the lock"}
         try:
             return _run_locked(sf, store, now, normalisation_horizon)
         finally:
+            # `finally` runs even if scoring crashed, so the lock is always released.
             lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": SCORING_LOCK_KEY})
             lock_conn.commit()
 
 
 def _run_locked(sf: sessionmaker[Session], store: PriceStore, now: dt.datetime, norm_h: int) -> dict:
     t0 = time.monotonic()
+    # Record that a run started (so a crashed run is visible on the System tab too).
     with sf.begin() as s:
         run = ScoringRun()
         s.add(run)
-        s.flush()
+        s.flush()            # send the INSERT now, so Postgres assigns run.id
         run_id = run.id
     try:
-        marked = _mark_live_ideas(sf, store, now, norm_h)
-        n_contrib, model = _recompute_stats(sf)
-        snapshot = _rebuild_signals(sf, store, now, model)
+        marked = _mark_live_ideas(sf, store, now, norm_h)              # step 1
+        n_contrib, model = _recompute_stats(sf)                        # step 2
+        snapshot = _rebuild_signals(sf, store, now, model)             # step 3
         with sf.begin() as s:
             r = s.get(ScoringRun, run_id)
             r.finished_at = dt.datetime.now(dt.timezone.utc)
@@ -69,6 +91,7 @@ def _run_locked(sf: sessionmaker[Session], store: PriceStore, now: dt.datetime, 
         log.info("scoring run %s: %s", run_id, summary)
         return summary
     except Exception as e:
+        # Save the error on the run row, then re-raise so the caller knows it failed.
         with sf.begin() as s:
             r = s.get(ScoringRun, run_id)
             r.finished_at = dt.datetime.now(dt.timezone.utc)
@@ -76,37 +99,44 @@ def _run_locked(sf: sessionmaker[Session], store: PriceStore, now: dt.datetime, 
         raise
 
 
+# STEP 1: mark every idea that isn't final yet.
 def _mark_live_ideas(sf: sessionmaker[Session], store: PriceStore, now: dt.datetime, norm_h: int) -> int:
     with sf() as s:
         # Closed marks are final; everything else (new, pending, open, unscorable) is re-marked.
+        # outerjoin = LEFT JOIN: keep ideas that have no mark row yet (IdeaMark.idea_id IS NULL).
         rows = s.execute(
             select(TradeIdea.id, TradeIdea.ticker, TradeIdea.direction, TradeIdea.horizon_days,
                    TradeIdea.effective_at)
             .outerjoin(IdeaMark, IdeaMark.idea_id == TradeIdea.id)
-            .where((IdeaMark.idea_id.is_(None)) | (IdeaMark.status != "closed"))
+            .where((IdeaMark.idea_id.is_(None)) | (IdeaMark.status != "closed"))   # | = SQL OR
         ).all()
     if not rows:
         return 0
 
+    # Group ideas by ticker, so each ticker's prices are fetched ONCE, not once per idea.
     by_ticker: dict[str, list] = defaultdict(list)
     for r in rows:
         by_ticker[r.ticker].append(r)
 
-    bench_cache: dict[str, list] = {}
+    bench_cache: dict[str, list] = {}       # benchmark bars, also fetched once per benchmark
     results: list[tuple[int, MarkResult]] = []
     for ticker, ideas in by_ticker.items():
         ex = exchange_for(ticker)
+        # Prices from a week before the oldest idea on this ticker.
         start = min(i.effective_at for i in ideas).date() - dt.timedelta(days=7)
         bars = store.get_bars(ticker, start)
         bench = ex.benchmark
+        # Fetch benchmark bars if we don't have them yet, or the ones we have start too late.
         if bench not in bench_cache or (bench_cache[bench] and bench_cache[bench][0].date > start):
             bench_cache[bench] = store.get_bars(bench, start)
         for i in ideas:
             spec = IdeaSpec(ticker, i.direction, i.horizon_days, i.effective_at)
             results.append((i.id, mark_idea(spec, bars, bench_cache[bench], bench, ex, now, norm_h)))
 
+    # Save all marks in one transaction (UPSERT: insert new marks, update existing ones).
     with sf.begin() as s:
         for idea_id, m in results:
+            # Every field of the MarkResult dataclass as a dict: {"status": ..., "entry_price": ...}.
             values = {k: getattr(m, k) for k in MarkResult.__dataclass_fields__}
             stmt = pg_insert(IdeaMark).values(idea_id=idea_id, **values)
             s.execute(stmt.on_conflict_do_update(index_elements=["idea_id"],
@@ -114,20 +144,21 @@ def _mark_live_ideas(sf: sessionmaker[Session], store: PriceStore, now: dt.datet
     return len(results)
 
 
+# STEP 2: recompute every contributor's stats and skill.
 def _recompute_stats(sf: sessionmaker[Session]):
     with sf() as s:
         rows = s.execute(
             select(TradeIdea.contributor_id, IdeaMark.status, IdeaMark.normalised_excess)
             .outerjoin(IdeaMark, IdeaMark.idea_id == TradeIdea.id)).all()
-    closed: dict[int, list[float]] = defaultdict(list)
-    counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    closed: dict[int, list[float]] = defaultdict(list)                    # cid -> [closed returns]
+    counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))   # cid -> {status: count}
     for cid, status, ne in rows:
         counts[cid]["total"] += 1
-        counts[cid][status or "unmarked"] += 1
+        counts[cid][status or "unmarked"] += 1         # no mark yet -> "unmarked"
         if status == "closed" and ne is not None:
-            closed[cid].append(ne)
+            closed[cid].append(ne)                     # only CLOSED ideas count towards skill
         else:
-            closed.setdefault(cid, [])
+            closed.setdefault(cid, [])                 # make sure everyone appears, even with 0 closed
     estimates, model = estimate_skill(closed)
     with sf.begin() as s:
         for cid, est in estimates.items():
@@ -144,18 +175,22 @@ def _recompute_stats(sf: sessionmaker[Session]):
                             "n_contributors": model.n_contributors, "n_closed_ideas": model.n_ideas}
 
 
+# STEP 3: build the Signals page data.
 def _rebuild_signals(sf: sessionmaker[Session], store: PriceStore, now: dt.datetime, model: dict) -> dict:
     with sf() as s:
+        # Ideas that are still live (open or about to enter), oldest first.
         live = s.execute(
             select(TradeIdea.ticker, TradeIdea.direction, TradeIdea.contributor_id)
             .join(IdeaMark, IdeaMark.idea_id == TradeIdea.id)
             .where(IdeaMark.status.in_(["open", "pending_entry"]))
             .order_by(TradeIdea.effective_at)).all()
+        # {contributor_id: P(skill > 0)}
         probs = dict(s.execute(select(ContributorStat.contributor_id, ContributorStat.prob_positive)).all())
     weights = {cid: contributor_weight(p) for cid, p in probs.items()}
     signals = build_signals([(r.ticker, r.direction, r.contributor_id) for r in live], weights)
     port = portfolio_weights(signals)
 
+    # ~400 calendar days of daily returns for each portfolio ticker, for the risk numbers.
     rets = {}
     start = now.date() - dt.timedelta(days=400)
     for t in port:
@@ -163,6 +198,7 @@ def _rebuild_signals(sf: sessionmaker[Session], store: PriceStore, now: dt.datet
         rets[t] = daily_returns([(b.date, b.close) for b in bars])
     risk = historical_risk(port, rets)
 
+    # Save a snapshot; GET /api/signals returns the newest one.
     payload = {"generated_at": now.isoformat(), "signals": signals_to_json(signals),
                "portfolio": port, "risk": risk, "model": model}
     with sf.begin() as s:

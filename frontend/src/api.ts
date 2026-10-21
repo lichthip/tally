@@ -1,7 +1,24 @@
+// =============================================================================
+// api.ts: HOW THE WEBSITE TALKS TO THE BACKEND, PLUS THE SHAPES OF THE DATA
+// -----------------------------------------------------------------------------
+// 1. API_BASE: the backend's address. In production it comes from the VITE_API_URL
+//    environment variable, which Vite bakes into the built JavaScript at BUILD time.
+//    (That's why changing it on Vercel needs a Redeploy.)
+// 2. adminToken: save/load the admin token in the browser's localStorage, so you don't
+//    have to paste it again after a refresh.
+// 3. api(): one wrapper around fetch() used by every page. It adds the JSON header (and
+//    the admin header if asked) and turns error responses into a thrown ApiError with
+//    the server's message.
+// 4. interfaces: TypeScript descriptions of the JSON each endpoint returns (they mirror
+//    the *_json functions in backend/tally/api/routes.py). They only exist at compile
+//    time and catch typos like idea.tikcer.
+// =============================================================================
 // Typed client for the Tally API.
+// ?? = "if the left side is null/undefined, use the right side". The regex removes a trailing "/".
 export const API_BASE = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
 const TOKEN_KEY = "tally.adminToken";
+// try/catch because localStorage can throw (private browsing, blocked storage).
 export const adminToken = {
   get: (): string => {
     try { return localStorage.getItem(TOKEN_KEY) ?? ""; } catch { return ""; }
@@ -11,22 +28,32 @@ export const adminToken = {
   },
 };
 
+// An Error that also carries the HTTP status (401, 409, 502...).
+// `public status` in the constructor declares and assigns the field in one go.
 export class ApiError extends Error {
   constructor(public status: number, message: string) { super(message); }
 }
 
+// <T> is a "generic": the caller says what type the JSON will be, e.g. api<Idea[]>("/api/ideas").
+// `init` = the usual fetch options (method, body...) plus our own `admin` flag.
+// async/await: fetch takes time; `await` pauses this function until the response arrives,
+// without freezing the page.
 export async function api<T>(path: string, init: RequestInit & { admin?: boolean } = {}): Promise<T> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (init.admin) headers["X-Admin-Token"] = adminToken.get();
+  if (init.admin) headers["X-Admin-Token"] = adminToken.get();     // backend's require_admin reads this
+  // { ...a, ...b } merges objects (later keys win), so callers can still add their own headers.
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers: { ...headers, ...(init.headers as object) } });
-  if (!res.ok) {
+  if (!res.ok) {                                   // ok = status 200-299
     let detail = res.statusText;
+    // FastAPI errors look like {"detail": "admin token required"}. Use that message if present.
     try { const b = await res.json(); detail = typeof b.detail === "string" ? b.detail : JSON.stringify(b.detail); } catch { /* not json */ }
     throw new ApiError(res.status, detail);
   }
   return res.json() as Promise<T>;
 }
 
+// ---- Data shapes (mirror the backend's JSON) ---------------------------------
+// `string | null` = may be missing. A union like "LONG" | "SHORT" = only these exact values.
 export interface Mark {
   status: "pending_entry" | "open" | "closed" | "unscorable";
   entry_date: string | null; entry_price: number | null; bench_ticker: string | null;
@@ -53,7 +80,7 @@ export interface Post {
   posted_at: string | null; received_at: string; status: string; error: string | null;
   extractor: string | null; processed_at: string | null;
   extraction: { status: string; candidates: Candidate[]; notes: string[]; cached?: boolean } | null;
-  ideas?: Idea[];
+  ideas?: Idea[];          // ? = optional field (only present on GET /api/posts/{id})
 }
 
 export interface IngestResult { post_id: number; status: string; duplicate: boolean; job_id: string | null }
@@ -81,7 +108,7 @@ export interface SystemInfo {
   dead_letters: { id: string; payload: { post_id?: number }; attempts: number; error: string | null; at: string | null }[];
   workers: { worker_id: string; processed: number; failed: number; last_seen: string; alive: boolean }[];
   scoring_runs: { id: number; started_at: string; finished_at: string | null; ideas_marked: number; contributors_scored: number; error: string | null }[];
-  post_counts: Record<string, number>;
+  post_counts: Record<string, number>;      // Record<K, V> = an object/dictionary from K to V
   simulated_seeded: boolean;
   config: {
     extractor: string; llm_requests_per_minute: number | null; review_confidence_threshold: number;

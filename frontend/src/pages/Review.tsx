@@ -1,15 +1,29 @@
+// =============================================================================
+// pages/Review.tsx: THE REVIEW TAB (admin only): HUMAN-IN-THE-LOOP
+// -----------------------------------------------------------------------------
+// GET /api/review lists posts with status "needs_review". Each one becomes a
+// <ReviewItem>: the post text, the pipeline's notes (WHY it was flagged), and an
+// editable table of suggested ideas. You can fix tickers, directions and horizons, add or
+// remove rows, then:
+//   Approve -> POST /api/review/{id}/approve with the edited rows ("overrides")
+//   Reject  -> POST /api/review/{id}/reject
+// =============================================================================
 import { useState } from "react";
 import { api, type Post } from "../api";
 import { Dir, when } from "../format";
 import { useApi } from "../useApi";
 
+// One editable row. horizon_days can be "" while the input box is empty.
 type Row = { ticker: string; direction: string; horizon_days: number | "" };
 type ApproveResult = { post_id: number; ideas_created: number; effective_at: string };
 
 export default function Review() {
+  // admin=true -> sends the token header (this endpoint is admin-only).
   const { data, error, reload } = useApi<Post[]>("/api/review", undefined, true);
   const [log, setLog] = useState<string[]>([]);
-  const done = (msg: string) => { setLog((l) => [msg, ...l].slice(0, 5)); reload(); };
+  // Called by an item when it's approved/rejected: keep the last 5 messages, and re-fetch
+  // the list (so the handled item disappears).
+  const done =(msg: string) => { setLog((l) => [msg, ...l].slice(0, 5)); reload(); };
 
   return (
     <section className="card">
@@ -26,6 +40,7 @@ export default function Review() {
   );
 }
 
+// One flagged post. Its rows start as the pipeline's suggestions (or one blank row).
 function ReviewItem({ post, onDone }: { post: Post; onDone: (msg: string) => void }) {
   const cands = post.extraction?.candidates ?? [];
   const [rows, setRows] = useState<Row[]>(
@@ -35,11 +50,16 @@ function ReviewItem({ post, onDone }: { post: Post; onDone: (msg: string) => voi
   const [msg, setMsg] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
 
+  // Row editing. React state must never be changed in place, so each helper builds a NEW
+  // array: update = copy with row i changed (Partial<Row> = any subset of a row's fields),
+  // remove = copy without row i, add = copy plus a blank row.
   const update = (i: number, patch: Partial<Row>) => setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const remove = (i: number) => setRows(rows.filter((_, j) => j !== i));
   const add = () => setRows([...rows, { ticker: "", direction: "LONG", horizon_days: 20 }]);
   const valid = rows.filter((r) => r.ticker.trim());
 
+  // Send the non-empty rows as overrides. The backend re-checks every ticker (an unknown
+  // one -> 409 error, shown in red) and sets effective_at = now (approval time).
   async function approve() {
     setMsg(null);
     if (valid.length === 0) { setMsg("Add at least one ticker, or reject the post instead."); return; }
@@ -63,6 +83,9 @@ function ReviewItem({ post, onDone }: { post: Post; onDone: (msg: string) => voi
     } catch (e) { setMsg(e instanceof Error ? e.message : String(e)); }
   }
 
+  // Left: who/when/model, the flag notes, and the post (clamped to a few lines; long posts
+  // get "show full post"). Right: the editable rows, with the model's suggestion and
+  // confidence shown next to each row.
   return (
     <div className="review">
       <div className="review-text">
