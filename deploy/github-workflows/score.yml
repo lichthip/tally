@@ -1,0 +1,20 @@
+# Free Render instances sleep when idle, which pauses the embedded scheduler.
+# This wakes the API once a day and triggers a scoring run.
+# Set repository secrets TALLY_API_URL (e.g. https://tally-api.onrender.com) and TALLY_ADMIN_TOKEN.
+name: daily-score
+on:
+  schedule: [{ cron: "30 22 * * 1-5" }]   # 22:30 UTC, after the US close
+  workflow_dispatch: {}
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    steps:
+      - name: wake the API (cold start can take ~1 min)
+        run: curl -sf --retry 6 --retry-delay 20 "$TALLY_API_URL/api/health"
+        env: { TALLY_API_URL: "${{ secrets.TALLY_API_URL }}" }
+      - name: trigger scoring
+        run: curl -sf -X POST -H "X-Admin-Token: $TOKEN" "$TALLY_API_URL/api/admin/score"
+        env:
+          TALLY_API_URL: "${{ secrets.TALLY_API_URL }}"
+          TOKEN: "${{ secrets.TALLY_ADMIN_TOKEN }}"

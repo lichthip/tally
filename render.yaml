@@ -1,0 +1,39 @@
+# Render Blueprint: one free web service runs the API plus embedded worker and scheduler.
+# Database: the same Neon Postgres you use locally (or a Neon branch); paste its URL as DATABASE_URL.
+services:
+  - type: web
+    name: tally-api
+    runtime: python
+    region: singapore
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn tally.api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DATABASE_URL
+        sync: false            # secret: entered in the Render dashboard
+      - key: ADMIN_TOKEN
+        generateValue: true    # Render creates a random token; copy it from the dashboard
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GROQ_API_KEY
+        sync: false            # secret
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: LLM_REQUESTS_PER_MINUTE
+        value: "6"
+      - key: QUEUE_BACKEND
+        value: postgres
+      - key: MARKET_DATA_PROVIDER
+        value: yfinance
+      - key: EMBEDDED_WORKER
+        value: "true"
+      - key: EMBEDDED_SCHEDULER
+        value: "true"
+      - key: WORKER_CONCURRENCY
+        value: "1"
+      - key: CORS_ORIGINS
+        sync: false            # your Vercel URL, e.g. https://tally-xyz.vercel.app

@@ -1,0 +1,111 @@
+ticker,name,exchange,aliases
+AAPL,Apple Inc.,US,apple|iphone maker
+MSFT,Microsoft Corporation,US,microsoft
+NVDA,NVIDIA Corporation,US,nvidia|team green
+GOOGL,Alphabet Inc. Class A,US,alphabet|google
+AMZN,Amazon.com Inc.,US,amazon
+META,Meta Platforms Inc.,US,meta|facebook
+TSLA,Tesla Inc.,US,tesla
+AMD,Advanced Micro Devices Inc.,US,amd|advanced micro devices
+INTC,Intel Corporation,US,intel
+AVGO,Broadcom Inc.,US,broadcom
+TSM,Taiwan Semiconductor Manufacturing,US,tsmc|taiwan semi|taiwan semiconductor
+ASML,ASML Holding N.V.,US,asml
+QCOM,Qualcomm Inc.,US,qualcomm
+MU,Micron Technology Inc.,US,micron
+ARM,Arm Holdings plc,US,arm holdings
+SMCI,Super Micro Computer Inc.,US,supermicro|super micro
+ORCL,Oracle Corporation,US,oracle
+CRM,Salesforce Inc.,US,salesforce
+ADBE,Adobe Inc.,US,adobe
+NFLX,Netflix Inc.,US,netflix
+PLTR,Palantir Technologies Inc.,US,palantir
+SNOW,Snowflake Inc.,US,snowflake
+CRWD,CrowdStrike Holdings Inc.,US,crowdstrike
+PANW,Palo Alto Networks Inc.,US,palo alto networks
+NET,Cloudflare Inc.,US,cloudflare
+SHOP,Shopify Inc.,US,shopify
+UBER,Uber Technologies Inc.,US,uber
+ABNB,Airbnb Inc.,US,airbnb
+COIN,Coinbase Global Inc.,US,coinbase
+HOOD,Robinhood Markets Inc.,US,robinhood
+MSTR,MicroStrategy Inc.,US,microstrategy|strategy
+PYPL,PayPal Holdings Inc.,US,paypal
+SQ,Block Inc.,US,block|square
+SE,Sea Limited,US,sea limited|sea ltd|shopee|garena
+GRAB,Grab Holdings Ltd.,US,grab
+BABA,Alibaba Group Holding Ltd.,US,alibaba
+PDD,PDD Holdings Inc.,US,pdd|pinduoduo|temu
+JD,JD.com Inc.,US,jd.com
+NIO,NIO Inc.,US,nio
+BIDU,Baidu Inc.,US,baidu
+TCEHY,Tencent Holdings Ltd. ADR,US,tencent
+JPM,JPMorgan Chase & Co.,US,jpmorgan|jp morgan|jpm
+GS,Goldman Sachs Group Inc.,US,goldman sachs|goldman
+MS,Morgan Stanley,US,morgan stanley
+BAC,Bank of America Corp.,US,bank of america|bofa
+C,Citigroup Inc.,US,citigroup|citi
+WFC,Wells Fargo & Co.,US,wells fargo
+BRK-B,Berkshire Hathaway Inc. Class B,US,berkshire|berkshire hathaway
+V,Visa Inc.,US,visa
+MA,Mastercard Inc.,US,mastercard
+BLK,BlackRock Inc.,US,blackrock
+KKR,KKR & Co. Inc.,US,kkr
+SCHW,Charles Schwab Corp.,US,schwab|charles schwab
+XOM,Exxon Mobil Corporation,US,exxon|exxonmobil
+CVX,Chevron Corporation,US,chevron
+OXY,Occidental Petroleum Corp.,US,occidental
+JNJ,Johnson & Johnson,US,johnson & johnson|j&j
+PFE,Pfizer Inc.,US,pfizer
+MRK,Merck & Co. Inc.,US,merck
+LLY,Eli Lilly and Company,US,eli lilly|lilly
+NVO,Novo Nordisk A/S,US,novo nordisk|novo
+UNH,UnitedHealth Group Inc.,US,unitedhealth|united health
+ABBV,AbbVie Inc.,US,abbvie
+MRNA,Moderna Inc.,US,moderna
+WMT,Walmart Inc.,US,walmart
+COST,Costco Wholesale Corp.,US,costco
+TGT,Target Corporation,US,target corp
+HD,Home Depot Inc.,US,home depot
+NKE,Nike Inc.,US,nike
+SBUX,Starbucks Corporation,US,starbucks
+MCD,McDonald's Corporation,US,mcdonalds|mcdonald's
+KO,Coca-Cola Company,US,coca-cola|coke
+PEP,PepsiCo Inc.,US,pepsico|pepsi
+PG,Procter & Gamble Co.,US,procter & gamble|p&g
+DIS,Walt Disney Company,US,disney
+SONY,Sony Group Corporation,US,sony
+NTDOY,Nintendo Co. Ltd. ADR,US,nintendo
+BA,Boeing Company,US,boeing
+LMT,Lockheed Martin Corp.,US,lockheed|lockheed martin
+CAT,Caterpillar Inc.,US,caterpillar
+GE,GE Aerospace,US,general electric|ge aerospace
+F,Ford Motor Company,US,ford
+GM,General Motors Company,US,general motors|gm
+RIVN,Rivian Automotive Inc.,US,rivian
+LCID,Lucid Group Inc.,US,lucid
+T,AT&T Inc.,US,at&t
+VZ,Verizon Communications Inc.,US,verizon
+GME,GameStop Corp.,US,gamestop
+AMC,AMC Entertainment Holdings,US,amc entertainment
+SPY,SPDR S&P 500 ETF Trust,US,s&p 500|s&p|spx
+QQQ,Invesco QQQ Trust,US,nasdaq 100|nasdaq|qqq
+IWM,iShares Russell 2000 ETF,US,russell 2000|small caps
+DIA,SPDR Dow Jones Industrial Average ETF,US,dow jones|the dow
+TLT,iShares 20+ Year Treasury Bond ETF,US,long bonds|treasuries|20 year treasuries
+GLD,SPDR Gold Shares,US,gold
+SLV,iShares Silver Trust,US,silver
+USO,United States Oil Fund,US,oil|crude
+SMH,VanEck Semiconductor ETF,US,semis|semiconductors
+ARKK,ARK Innovation ETF,US,ark innovation|cathie wood fund
+D05.SI,DBS Group Holdings Ltd.,SI,dbs|dbs bank
+O39.SI,Oversea-Chinese Banking Corp.,SI,ocbc
+U11.SI,United Overseas Bank Ltd.,SI,uob
+Z74.SI,Singapore Telecommunications Ltd.,SI,singtel
+C6L.SI,Singapore Airlines Ltd.,SI,singapore airlines|sia
+S68.SI,Singapore Exchange Ltd.,SI,sgx|singapore exchange
+C38U.SI,CapitaLand Integrated Commercial Trust,SI,cict|capitaland integrated
+ES3.SI,SPDR Straits Times Index ETF,SI,sti|straits times index
+0700.HK,Tencent Holdings Ltd.,HK,tencent hk
+9988.HK,Alibaba Group (HK),HK,alibaba hk
+2800.HK,Tracker Fund of Hong Kong,HK,hang seng|hsi
